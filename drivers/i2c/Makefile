@@ -8,4 +8,6 @@ obj-$(CONFIG_I2C_QMSI) += i2c_qmsi.o
 obj-$(CONFIG_I2C_QMSI_SS) += i2c_qmsi_ss.o
 obj-$(CONFIG_I2C_SBCON) += i2c_sbcon.o
 obj-$(CONFIG_I2C_STM32LX) += i2c_stm32lx.o
+obj-$(CONFIG_I2C_STM32F4) += i2c_ll_stm32f4.o
+obj-$(CONFIG_TWIHS_SAM) += twihs_sam.o
 obj-$(CONFIG_TWIHS_SAM) += twihs_sam.o
