@@ -45,4 +45,18 @@ config NET_L2_BT_ZEP1656
 
 endif # NETWORKING
 
+if USB
+
+if USB_CDC_ACM
+
+config CDC_ACM_INT_EP_ADDR
+	default 0x81
+
+config CDC_ACM_IN_EP_ADDR
+	default 0x83
+
+endif # USB_CDC_ACM
+
+endif # USB
+
 endif # BOARD_96B_CARBON
