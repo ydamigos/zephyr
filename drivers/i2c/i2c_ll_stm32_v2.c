@@ -99,7 +99,6 @@ void stm32_i2c_event_isr(void *arg)
 
 	data->current.buf++;
 	data->current.len--;
-
 	if (!data->current.len) {
 		k_sem_give(&data->device_sync_sem);
 	}
