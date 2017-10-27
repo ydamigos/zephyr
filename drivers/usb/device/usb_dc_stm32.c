@@ -152,6 +152,10 @@ struct usb_dc_stm32_state {
 #ifdef USB
 	u32_t pma_offset;
 #endif /* USB */
+
+#ifdef CONFIG_USB_DC_STM32_DISCONN_ENABLE
+	struct device *usb_disconnect;
+#endif /* CONFIG_USB_DC_STM32_DISCONN_ENABLE */
 };
 
 static struct usb_dc_stm32_state usb_dc_stm32_state;
@@ -310,6 +314,16 @@ int usb_dc_attach(void)
 	int ret;
 
 	SYS_LOG_DBG("");
+
+#ifdef CONFIG_USB_DC_STM32_DISCONN_ENABLE
+	usb_dc_stm32_state.usb_disconnect =
+		device_get_binding(CONFIG_USB_DC_STM32_DISCONN_GPIO_PORT_NAME);
+	gpio_pin_configure(usb_dc_stm32_state.usb_disconnect,
+			   CONFIG_USB_DC_STM32_DISCONN_PIN, GPIO_DIR_OUT);
+	gpio_pin_write(usb_dc_stm32_state.usb_disconnect,
+		       CONFIG_USB_DC_STM32_DISCONN_PIN,
+		       CONFIG_USB_DC_STM32_DISCONN_PIN_LEVEL);
+#endif /* CONFIG_USB_DC_STM32_DISCONN_ENABLE */
 
 	ret = usb_dc_stm32_clock_enable();
 	if (ret) {
