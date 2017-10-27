@@ -2,6 +2,7 @@
 
 /*
  * Copyright (c) 2017 Christer Weinigel.
+ * Copyright (c) 2017, I-SENSE group of ICCS
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -53,6 +54,19 @@
 #define SYS_LOG_LEVEL CONFIG_SYS_LOG_USB_DRIVER_LEVEL
 #include <logging/sys_log.h>
 
+/*
+ * USB LL API provides the EP_TYPE_* defines STM32Cube does
+ * not provide USB LL API for STM32F0 and STM32F3 families.
+ * Map EP_TYPE_* defines to PCD_EP_TYPE_* defines
+ */
+#if defined(CONFIG_SOC_SERIES_STM32F3X) || defined(CONFIG_SOC_SERIES_STM32F0X)
+#define EP_TYPE_CTRL PCD_EP_TYPE_CTRL
+#define EP_TYPE_ISOC PCD_EP_TYPE_ISOC
+#define EP_TYPE_BULK PCD_EP_TYPE_BULK
+#define EP_TYPE_INTR PCD_EP_TYPE_INTR
+#endif
+/* CONFIG_SOC_SERIES_STM32F3X */
+
 /* Total in ep number = bidirectional ep number + in ep number */
 #define NUM_IN_EP (CONFIG_USB_NUM_BIDIR_ENDPOINTS + \
 		   CONFIG_USB_NUM_IN_ENDPOINTS)
@@ -67,6 +81,23 @@
  */
 #define NUM_BIDIR_EP NUM_OUT_EP
 
+#ifdef USB
+
+#define EP0_MPS 64U
+#define EP_MPS 64U
+
+/*
+ * USB BTABLE is stored in the PMA. The size of BTABLE is 4 bytes
+ * per endpoint.
+ *
+ */
+#define USB_BTABLE_SIZE  (8 * NUM_BIDIR_EP)
+
+#else /* USB_OTG_FS */
+
+#define EP0_MPS USB_OTG_MAX_EP0_SIZE
+#define EP_MPS USB_OTG_FS_MAX_PACKET_SIZE
+
 /* We need one RX FIFO and n TX-IN FIFOs */
 #define FIFO_NUM (1 + NUM_IN_EP)
 
@@ -75,6 +106,8 @@
 
 /* Allocate FIFO memory evenly between the FIFOs */
 #define FIFO_EP_WORDS (FIFO_WORDS / FIFO_NUM)
+
+#endif /* USB */
 
 /* Size of a USB SETUP packet */
 #define SETUP_SIZE 8
@@ -105,7 +138,11 @@ struct usb_dc_stm32_state {
 	usb_dc_status_callback status_cb; /* Status callback */
 	struct usb_dc_stm32_ep_state out_ep_state[NUM_OUT_EP];
 	struct usb_dc_stm32_ep_state in_ep_state[NUM_IN_EP];
-	u8_t ep_buf[NUM_BIDIR_EP][USB_OTG_FS_MAX_PACKET_SIZE];
+	u8_t ep_buf[NUM_BIDIR_EP][EP_MPS];
+
+#ifdef USB
+	u32_t pma_offset;
+#endif /* USB */
 };
 
 static struct usb_dc_stm32_state usb_dc_stm32_state;
@@ -138,8 +175,21 @@ static int usb_dc_stm32_clock_enable(void)
 {
 	struct device *clk = device_get_binding(STM32_CLOCK_CONTROL_NAME);
 	struct stm32_pclken pclken = {
+
+#ifdef USB
+		.bus = STM32_CLOCK_BUS_APB1,
+		.enr = LL_APB1_GRP1_PERIPH_USB,
+#else /* USB_OTG_FS */
+
+#ifdef CONFIG_SOC_SERIES_STM32F1X
+		.bus = STM32_CLOCK_BUS_AHB1,
+		.enr = LL_AHB1_GRP1_PERIPH_OTGFS,
+#else
 		.bus = STM32_CLOCK_BUS_AHB2,
 		.enr = LL_AHB2_GRP1_PERIPH_OTGFS,
+#endif /* CONFIG_SOC_SERIES_STM32F1X */
+
+#endif /* USB */
 	};
 
 	clock_control_on(clk, (clock_control_subsys_t *)&pclken);
@@ -147,6 +197,51 @@ static int usb_dc_stm32_clock_enable(void)
 	return 0;
 }
 
+#ifdef USB
+static int usb_dc_stm32_init(void)
+{
+	HAL_StatusTypeDef status;
+	unsigned int i;
+
+	usb_dc_stm32_state.pcd.Instance = USB;
+	usb_dc_stm32_state.pcd.Init.speed = PCD_SPEED_FULL;
+	usb_dc_stm32_state.pcd.Init.dev_endpoints = NUM_BIDIR_EP;
+	usb_dc_stm32_state.pcd.Init.phy_itface = PCD_PHY_EMBEDDED;
+	usb_dc_stm32_state.pcd.Init.ep0_mps = PCD_EP0MPS_64;
+	usb_dc_stm32_state.pcd.Init.low_power_enable = 0;
+
+	/* Start PMA configuration for the endpoints after the BTABLE. */
+	usb_dc_stm32_state.pma_offset = USB_BTABLE_SIZE;
+
+	SYS_LOG_DBG("HAL_PCD_Init");
+	status = HAL_PCD_Init(&usb_dc_stm32_state.pcd);
+	if (status != HAL_OK) {
+		SYS_LOG_ERR("PCD_Init failed, %d", (int)status);
+		return -EIO;
+	}
+
+	SYS_LOG_DBG("HAL_PCD_Start");
+	status = HAL_PCD_Start(&usb_dc_stm32_state.pcd);
+	if (status != HAL_OK) {
+		SYS_LOG_ERR("PCD_Start failed, %d", (int)status);
+		return -EIO;
+	}
+
+	usb_dc_stm32_state.out_ep_state[EP0_IDX].ep_mps = EP0_MPS;
+	usb_dc_stm32_state.out_ep_state[EP0_IDX].ep_type = EP_TYPE_CTRL;
+	usb_dc_stm32_state.in_ep_state[EP0_IDX].ep_mps = EP0_MPS;
+	usb_dc_stm32_state.in_ep_state[EP0_IDX].ep_type = EP_TYPE_CTRL;
+
+	for (i = 0; i < NUM_IN_EP; i++) {
+		k_sem_init(&usb_dc_stm32_state.in_ep_state[i].write_sem, 1, 1);
+	}
+
+	IRQ_CONNECT(CONFIG_USB_IRQ, CONFIG_USB_IRQ_PRI,
+		    usb_dc_stm32_isr, 0, 0);
+	irq_enable(CONFIG_USB_IRQ);
+	return 0;
+}
+#else /* USB_OTG_FS */
 static int usb_dc_stm32_init(void)
 {
 	HAL_StatusTypeDef status;
@@ -158,8 +253,11 @@ static int usb_dc_stm32_init(void)
 	usb_dc_stm32_state.pcd.Init.speed = USB_OTG_SPEED_FULL;
 	usb_dc_stm32_state.pcd.Init.phy_itface = PCD_PHY_EMBEDDED;
 	usb_dc_stm32_state.pcd.Init.ep0_mps = USB_OTG_MAX_EP0_SIZE;
-	usb_dc_stm32_state.pcd.Init.dma_enable = DISABLE;
 	usb_dc_stm32_state.pcd.Init.vbus_sensing_enable = DISABLE;
+
+#ifndef CONFIG_SOC_SERIES_STM32F1X
+	usb_dc_stm32_state.pcd.Init.dma_enable = DISABLE;
+#endif
 
 	SYS_LOG_DBG("HAL_PCD_Init");
 	status = HAL_PCD_Init(&usb_dc_stm32_state.pcd);
@@ -194,6 +292,7 @@ static int usb_dc_stm32_init(void)
 
 	return 0;
 }
+#endif /* USB */
 
 /* Zephyr USB device controller API implementation */
 
@@ -268,8 +367,8 @@ int usb_dc_ep_start_read(u8_t ep, u8_t *data, u32_t max_data_len)
 		return -EINVAL;
 	}
 
-	if (max_data_len > USB_OTG_FS_MAX_PACKET_SIZE) {
-		max_data_len = USB_OTG_FS_MAX_PACKET_SIZE;
+	if (max_data_len > EP_MPS) {
+		max_data_len = EP_MPS;
 	}
 
 	status = HAL_PCD_EP_Receive(&usb_dc_stm32_state.pcd, ep,
@@ -308,6 +407,15 @@ int usb_dc_ep_configure(const struct usb_dc_ep_cfg_data * const ep_cfg)
 		return -EINVAL;
 	}
 
+#ifdef USB
+	if (CONFIG_USB_RAM_SIZE <=
+	    (usb_dc_stm32_state.pma_offset + ep_cfg->ep_mps)) {
+		return -EINVAL;
+	}
+	HAL_PCDEx_PMAConfig(&usb_dc_stm32_state.pcd, ep, PCD_SNG_BUF,
+			    usb_dc_stm32_state.pma_offset);
+	usb_dc_stm32_state.pma_offset += ep_cfg->ep_mps;
+#endif
 	ep_state->ep_mps = ep_cfg->ep_mps;
 
 	switch (ep_cfg->ep_type) {
@@ -422,8 +530,8 @@ int usb_dc_ep_enable(const u8_t ep)
 
 	if (EP_IS_OUT(ep) && ep != EP0_OUT) {
 		return usb_dc_ep_start_read(ep,
-					   usb_dc_stm32_state.ep_buf[EP_IDX(ep)],
-					   USB_OTG_FS_MAX_PACKET_SIZE);
+					  usb_dc_stm32_state.ep_buf[EP_IDX(ep)],
+					  EP_MPS);
 	}
 
 	return 0;
@@ -529,7 +637,7 @@ int usb_dc_ep_read(const u8_t ep, u8_t *const data, const u32_t max_data_len,
 	 */
 	if (ep != EP0_OUT && !ep_state->read_count) {
 		usb_dc_ep_start_read(ep, usb_dc_stm32_state.ep_buf[EP_IDX(ep)],
-				     USB_OTG_FS_MAX_PACKET_SIZE);
+				     EP_MPS);
 	}
 
 done:
@@ -545,6 +653,10 @@ done:
 void HAL_PCD_ResetCallback(PCD_HandleTypeDef *hpcd)
 {
 	SYS_LOG_DBG("");
+
+	HAL_PCD_EP_Open(&usb_dc_stm32_state.pcd, EP0_IN, EP0_MPS, EP_TYPE_CTRL);
+	HAL_PCD_EP_Open(&usb_dc_stm32_state.pcd, EP0_OUT, EP0_MPS,
+			EP_TYPE_CTRL);
 
 	if (usb_dc_stm32_state.status_cb) {
 		usb_dc_stm32_state.status_cb(USB_DC_RESET, NULL);
