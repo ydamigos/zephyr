@@ -44,4 +44,20 @@ config PWM_STM32_1
 
 endif # PWM
 
+if USB
+
+config USB_DC_STM32_DISCONN_ENABLE
+	default y
+
+config USB_DC_STM32_DISCONN_GPIO_PORT_NAME
+	default "GPIOC"
+
+config USB_DC_STM32_DISCONN_PIN
+	default 12
+
+config USB_DC_STM32_DISCONN_PIN_LEVEL
+	default 0
+
+endif # USB
+
 endif # BOARD_OLIMEXINO_STM32
