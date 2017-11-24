@@ -149,10 +149,6 @@ struct usb_dc_stm32_state {
 	struct usb_dc_stm32_ep_state in_ep_state[NUM_IN_EP];
 	u8_t ep_buf[NUM_BIDIR_EP][EP_MPS];
 
-#ifdef USB
-	u32_t pma_offset;
-#endif /* USB */
-
 #ifdef CONFIG_USB_DC_STM32_DISCONN_ENABLE
 	struct device *usb_disconnect;
 #endif /* CONFIG_USB_DC_STM32_DISCONN_ENABLE */
@@ -224,9 +220,6 @@ static int usb_dc_stm32_init(void)
 	usb_dc_stm32_state.pcd.Init.ep0_mps = PCD_EP0MPS_64;
 	usb_dc_stm32_state.pcd.Init.low_power_enable = 0;
 
-	/* Start PMA configuration for the endpoints after the BTABLE. */
-	usb_dc_stm32_state.pma_offset = USB_BTABLE_SIZE;
-
 	SYS_LOG_DBG("HAL_PCD_Init");
 	status = HAL_PCD_Init(&usb_dc_stm32_state.pcd);
 	if (status != HAL_OK) {
@@ -239,7 +232,7 @@ static int usb_dc_stm32_init(void)
 	 * and size is specfied in a buffer descriptor table, which is also
 	 * located in the packet memory. so we need reserve space for restore
 	 * buffer descriptor table */
-	pma_addr = NUM_BIDIR_EP * 8;
+	pma_addr = USB_BTABLE_SIZE;
 
 	for (i = 0; i < NUM_BIDIR_EP * 2; i++) { /* all endpoint is bi-dir */
 		ep = (i >> 1) | ((i & 0x1) << 7);
@@ -452,15 +445,6 @@ int usb_dc_ep_configure(const struct usb_dc_ep_cfg_data * const ep_cfg)
 		return -EINVAL;
 	}
 
-#ifdef USB
-	if (CONFIG_USB_RAM_SIZE <=
-	    (usb_dc_stm32_state.pma_offset + ep_cfg->ep_mps)) {
-		return -EINVAL;
-	}
-	HAL_PCDEx_PMAConfig(&usb_dc_stm32_state.pcd, ep, PCD_SNG_BUF,
-			    usb_dc_stm32_state.pma_offset);
-	usb_dc_stm32_state.pma_offset += ep_cfg->ep_mps;
-#endif
 	ep_state->ep_mps = ep_cfg->ep_mps;
 
 	switch (ep_cfg->ep_type) {
