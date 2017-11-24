@@ -215,6 +215,7 @@ static int usb_dc_stm32_init(void)
 {
 	HAL_StatusTypeDef status;
 	unsigned int i;
+	unsigned int ep, mps, pma_addr;
 
 	usb_dc_stm32_state.pcd.Instance = USB;
 	usb_dc_stm32_state.pcd.Init.speed = PCD_SPEED_FULL;
@@ -232,6 +233,27 @@ static int usb_dc_stm32_init(void)
 		SYS_LOG_ERR("PCD_Init failed, %d", (int)status);
 		return -EIO;
 	}
+
+	/* each endpoint is associated with two packet buffers. Buffers can
+	 * be placed anywhere inside the packet memory because their location
+	 * and size is specfied in a buffer descriptor table, which is also
+	 * located in the packet memory. so we need reserve space for restore
+	 * buffer descriptor table */
+	pma_addr = NUM_BIDIR_EP * 8;
+
+	for (i = 0; i < NUM_BIDIR_EP * 2; i++) { /* all endpoint is bi-dir */
+		ep = (i >> 1) | ((i & 0x1) << 7);
+		mps = (i < 2) ? EP0_MPS: EP_MPS;
+
+		HAL_PCDEx_PMAConfig(&usb_dc_stm32_state.pcd, ep,
+				PCD_SNG_BUF, pma_addr);
+		SYS_LOG_DBG("PMA: EP%02X in %03X", ep, pma_addr);
+		pma_addr += mps;
+
+		if (pma_addr + mps > CONFIG_USB_RAM_SIZE)
+			break; /* no enough memory for next endpoint */
+	}
+
 
 	SYS_LOG_DBG("HAL_PCD_Start");
 	status = HAL_PCD_Start(&usb_dc_stm32_state.pcd);
