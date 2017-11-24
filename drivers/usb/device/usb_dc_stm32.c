@@ -2,6 +2,7 @@
 
 /*
  * Copyright (c) 2017 Christer Weinigel.
+ * Copyright (c) 2017, I-SENSE group of ICCS
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -49,19 +50,73 @@
 #include <usb/usb_device.h>
 #include <clock_control/stm32_clock_control.h>
 #include <misc/util.h>
+#include <gpio.h>
 
 #define SYS_LOG_LEVEL CONFIG_SYS_LOG_USB_DRIVER_LEVEL
 #include <logging/sys_log.h>
 
+/*
+ * USB LL API provides the EP_TYPE_* defines STM32Cube does
+ * not provide USB LL API for STM32F0 and STM32F3 families.
+ * Map EP_TYPE_* defines to PCD_EP_TYPE_* defines
+ */
+#if defined(CONFIG_SOC_SERIES_STM32F3X) || defined(CONFIG_SOC_SERIES_STM32F0X)
+#define EP_TYPE_CTRL PCD_EP_TYPE_CTRL
+#define EP_TYPE_ISOC PCD_EP_TYPE_ISOC
+#define EP_TYPE_BULK PCD_EP_TYPE_BULK
+#define EP_TYPE_INTR PCD_EP_TYPE_INTR
+#endif
+/* CONFIG_SOC_SERIES_STM32F3X */
 
-/* We need one RX FIFO and n TX FIFOs */
-#define FIFO_NUM (1 + CONFIG_USB_DC_STM32_EP_NUM)
+#ifndef CONFIG_USB_NUM_IN_ENDPOINTS
+#define CONFIG_USB_NUM_IN_ENDPOINTS 0
+#endif /* CONFIG_USB_NUM_IN_ENDPOINTS */
+
+#ifndef CONFIG_USB_NUM_OUT_ENDPOINTS
+#define CONFIG_USB_NUM_OUT_ENDPOINTS 0
+#endif /* CONFIG_USB_NUM_OUT_ENDPOINTS */
+
+/* Total in ep number = bidirectional ep number + in ep number */
+#define NUM_IN_EP (CONFIG_USB_NUM_BIDIR_ENDPOINTS + \
+		   CONFIG_USB_NUM_IN_ENDPOINTS)
+
+/* Total out ep number = bidirectional ep number + out ep number */
+#define NUM_OUT_EP (CONFIG_USB_NUM_BIDIR_ENDPOINTS + \
+		    CONFIG_USB_NUM_OUT_ENDPOINTS)
+/*
+ * Total bidirectional ep number = bidirectional ep number + (out ep number +
+ * in ep number) / 2.  Because out ep number = in ep number,
+ * total bidirectional ep number = total out ep number or total in ep number
+ */
+#define NUM_BIDIR_EP NUM_OUT_EP
+
+#ifdef USB
+
+#define EP0_MPS 64U
+#define EP_MPS 64U
+
+/*
+ * USB BTABLE is stored in the PMA. The size of BTABLE is 4 bytes
+ * per endpoint.
+ *
+ */
+#define USB_BTABLE_SIZE  (8 * NUM_BIDIR_EP)
+
+#else /* USB_OTG_FS */
+
+#define EP0_MPS USB_OTG_MAX_EP0_SIZE
+#define EP_MPS USB_OTG_FS_MAX_PACKET_SIZE
+
+/* We need one RX FIFO and n TX-IN FIFOs */
+#define FIFO_NUM (1 + NUM_IN_EP)
 
 /* 4-byte words FIFO */
-#define FIFO_WORDS (CONFIG_USB_DC_STM32_RAM_SIZE / 4)
+#define FIFO_WORDS (CONFIG_USB_RAM_SIZE / 4)
 
 /* Allocate FIFO memory evenly between the FIFOs */
 #define FIFO_EP_WORDS (FIFO_WORDS / FIFO_NUM)
+
+#endif /* USB */
 
 /* Size of a USB SETUP packet */
 #define SETUP_SIZE 8
@@ -90,9 +145,17 @@ struct usb_dc_stm32_ep_state {
 struct usb_dc_stm32_state {
 	PCD_HandleTypeDef pcd;	/* Storage for the HAL_PCD api */
 	usb_dc_status_callback status_cb; /* Status callback */
-	struct usb_dc_stm32_ep_state out_ep_state[CONFIG_USB_DC_STM32_EP_NUM];
-	struct usb_dc_stm32_ep_state in_ep_state[CONFIG_USB_DC_STM32_EP_NUM];
-	u8_t ep_buf[CONFIG_USB_DC_STM32_EP_NUM][USB_OTG_FS_MAX_PACKET_SIZE];
+	struct usb_dc_stm32_ep_state out_ep_state[NUM_OUT_EP];
+	struct usb_dc_stm32_ep_state in_ep_state[NUM_IN_EP];
+	u8_t ep_buf[NUM_BIDIR_EP][EP_MPS];
+
+#ifdef USB
+	u32_t pma_offset;
+#endif /* USB */
+
+#ifdef CONFIG_USB_DC_STM32_DISCONN_ENABLE
+	struct device *usb_disconnect;
+#endif /* CONFIG_USB_DC_STM32_DISCONN_ENABLE */
 };
 
 static struct usb_dc_stm32_state usb_dc_stm32_state;
@@ -103,7 +166,7 @@ static struct usb_dc_stm32_ep_state *usb_dc_stm32_get_ep_state(u8_t ep)
 {
 	struct usb_dc_stm32_ep_state *ep_state_base;
 
-	if (EP_IDX(ep) >= CONFIG_USB_DC_STM32_EP_NUM) {
+	if (EP_IDX(ep) >= NUM_BIDIR_EP) {
 		return NULL;
 	}
 
@@ -125,8 +188,21 @@ static int usb_dc_stm32_clock_enable(void)
 {
 	struct device *clk = device_get_binding(STM32_CLOCK_CONTROL_NAME);
 	struct stm32_pclken pclken = {
+
+#ifdef USB
+		.bus = STM32_CLOCK_BUS_APB1,
+		.enr = LL_APB1_GRP1_PERIPH_USB,
+#else /* USB_OTG_FS */
+
+#ifdef CONFIG_SOC_SERIES_STM32F1X
+		.bus = STM32_CLOCK_BUS_AHB1,
+		.enr = LL_AHB1_GRP1_PERIPH_OTGFS,
+#else
 		.bus = STM32_CLOCK_BUS_AHB2,
 		.enr = LL_AHB2_GRP1_PERIPH_OTGFS,
+#endif /* CONFIG_SOC_SERIES_STM32F1X */
+
+#endif /* USB */
 	};
 
 	clock_control_on(clk, (clock_control_subsys_t *)&pclken);
@@ -134,6 +210,73 @@ static int usb_dc_stm32_clock_enable(void)
 	return 0;
 }
 
+#ifdef USB
+static int usb_dc_stm32_init(void)
+{
+	HAL_StatusTypeDef status;
+	unsigned int i;
+	unsigned int ep, mps, pma_addr;
+
+	usb_dc_stm32_state.pcd.Instance = USB;
+	usb_dc_stm32_state.pcd.Init.speed = PCD_SPEED_FULL;
+	usb_dc_stm32_state.pcd.Init.dev_endpoints = NUM_BIDIR_EP;
+	usb_dc_stm32_state.pcd.Init.phy_itface = PCD_PHY_EMBEDDED;
+	usb_dc_stm32_state.pcd.Init.ep0_mps = PCD_EP0MPS_64;
+	usb_dc_stm32_state.pcd.Init.low_power_enable = 0;
+
+	/* Start PMA configuration for the endpoints after the BTABLE. */
+	usb_dc_stm32_state.pma_offset = USB_BTABLE_SIZE;
+
+	SYS_LOG_DBG("HAL_PCD_Init");
+	status = HAL_PCD_Init(&usb_dc_stm32_state.pcd);
+	if (status != HAL_OK) {
+		SYS_LOG_ERR("PCD_Init failed, %d", (int)status);
+		return -EIO;
+	}
+
+	/* each endpoint is associated with two packet buffers. Buffers can
+	 * be placed anywhere inside the packet memory because their location
+	 * and size is specfied in a buffer descriptor table, which is also
+	 * located in the packet memory. so we need reserve space for restore
+	 * buffer descriptor table */
+	pma_addr = NUM_BIDIR_EP * 8;
+
+	for (i = 0; i < NUM_BIDIR_EP * 2; i++) { /* all endpoint is bi-dir */
+		ep = (i >> 1) | ((i & 0x1) << 7);
+		mps = (i < 2) ? EP0_MPS: EP_MPS;
+
+		HAL_PCDEx_PMAConfig(&usb_dc_stm32_state.pcd, ep,
+				PCD_SNG_BUF, pma_addr);
+		SYS_LOG_DBG("PMA: EP%02X in %03X", ep, pma_addr);
+		pma_addr += mps;
+
+		if (pma_addr + mps > CONFIG_USB_RAM_SIZE)
+			break; /* no enough memory for next endpoint */
+	}
+
+
+	SYS_LOG_DBG("HAL_PCD_Start");
+	status = HAL_PCD_Start(&usb_dc_stm32_state.pcd);
+	if (status != HAL_OK) {
+		SYS_LOG_ERR("PCD_Start failed, %d", (int)status);
+		return -EIO;
+	}
+
+	usb_dc_stm32_state.out_ep_state[EP0_IDX].ep_mps = EP0_MPS;
+	usb_dc_stm32_state.out_ep_state[EP0_IDX].ep_type = EP_TYPE_CTRL;
+	usb_dc_stm32_state.in_ep_state[EP0_IDX].ep_mps = EP0_MPS;
+	usb_dc_stm32_state.in_ep_state[EP0_IDX].ep_type = EP_TYPE_CTRL;
+
+	for (i = 0; i < NUM_IN_EP; i++) {
+		k_sem_init(&usb_dc_stm32_state.in_ep_state[i].write_sem, 1, 1);
+	}
+
+	IRQ_CONNECT(CONFIG_USB_IRQ, CONFIG_USB_IRQ_PRI,
+		    usb_dc_stm32_isr, 0, 0);
+	irq_enable(CONFIG_USB_IRQ);
+	return 0;
+}
+#else /* USB_OTG_FS */
 static int usb_dc_stm32_init(void)
 {
 	HAL_StatusTypeDef status;
@@ -141,12 +284,15 @@ static int usb_dc_stm32_init(void)
 
 	/* We only support OTG FS for now */
 	usb_dc_stm32_state.pcd.Instance = USB_OTG_FS;
-	usb_dc_stm32_state.pcd.Init.dev_endpoints = CONFIG_USB_DC_STM32_EP_NUM;
+	usb_dc_stm32_state.pcd.Init.dev_endpoints = NUM_BIDIR_EP;
 	usb_dc_stm32_state.pcd.Init.speed = USB_OTG_SPEED_FULL;
 	usb_dc_stm32_state.pcd.Init.phy_itface = PCD_PHY_EMBEDDED;
 	usb_dc_stm32_state.pcd.Init.ep0_mps = USB_OTG_MAX_EP0_SIZE;
-	usb_dc_stm32_state.pcd.Init.dma_enable = DISABLE;
 	usb_dc_stm32_state.pcd.Init.vbus_sensing_enable = DISABLE;
+
+#ifndef CONFIG_SOC_SERIES_STM32F1X
+	usb_dc_stm32_state.pcd.Init.dma_enable = DISABLE;
+#endif
 
 	SYS_LOG_DBG("HAL_PCD_Init");
 	status = HAL_PCD_Init(&usb_dc_stm32_state.pcd);
@@ -169,18 +315,19 @@ static int usb_dc_stm32_init(void)
 
 	/* TODO: make this dynamic (depending usage) */
 	HAL_PCDEx_SetRxFiFo(&usb_dc_stm32_state.pcd, FIFO_EP_WORDS);
-	for (i = 0; i < CONFIG_USB_DC_STM32_EP_NUM; i++) {
+	for (i = 0; i < NUM_IN_EP; i++) {
 		HAL_PCDEx_SetTxFiFo(&usb_dc_stm32_state.pcd, i,
 				    FIFO_EP_WORDS);
 		k_sem_init(&usb_dc_stm32_state.in_ep_state[i].write_sem, 1, 1);
 	}
 
-	IRQ_CONNECT(STM32F4_IRQ_OTG_FS, CONFIG_USB_DC_STM32_IRQ_PRI,
+	IRQ_CONNECT(CONFIG_USB_IRQ, CONFIG_USB_IRQ_PRI,
 		    usb_dc_stm32_isr, 0, 0);
-	irq_enable(STM32F4_IRQ_OTG_FS);
+	irq_enable(CONFIG_USB_IRQ);
 
 	return 0;
 }
+#endif /* USB */
 
 /* Zephyr USB device controller API implementation */
 
@@ -189,6 +336,16 @@ int usb_dc_attach(void)
 	int ret;
 
 	SYS_LOG_DBG("");
+
+#ifdef CONFIG_USB_DC_STM32_DISCONN_ENABLE
+	usb_dc_stm32_state.usb_disconnect =
+		device_get_binding(CONFIG_USB_DC_STM32_DISCONN_GPIO_PORT_NAME);
+	gpio_pin_configure(usb_dc_stm32_state.usb_disconnect,
+			   CONFIG_USB_DC_STM32_DISCONN_PIN, GPIO_DIR_OUT);
+	gpio_pin_write(usb_dc_stm32_state.usb_disconnect,
+		       CONFIG_USB_DC_STM32_DISCONN_PIN,
+		       CONFIG_USB_DC_STM32_DISCONN_PIN_LEVEL);
+#endif /* CONFIG_USB_DC_STM32_DISCONN_ENABLE */
 
 	ret = usb_dc_stm32_clock_enable();
 	if (ret) {
@@ -255,8 +412,8 @@ int usb_dc_ep_start_read(u8_t ep, u8_t *data, u32_t max_data_len)
 		return -EINVAL;
 	}
 
-	if (max_data_len > USB_OTG_FS_MAX_PACKET_SIZE) {
-		max_data_len = USB_OTG_FS_MAX_PACKET_SIZE;
+	if (max_data_len > EP_MPS) {
+		max_data_len = EP_MPS;
 	}
 
 	status = HAL_PCD_EP_Receive(&usb_dc_stm32_state.pcd, ep,
@@ -295,6 +452,15 @@ int usb_dc_ep_configure(const struct usb_dc_ep_cfg_data * const ep_cfg)
 		return -EINVAL;
 	}
 
+#ifdef USB
+	if (CONFIG_USB_RAM_SIZE <=
+	    (usb_dc_stm32_state.pma_offset + ep_cfg->ep_mps)) {
+		return -EINVAL;
+	}
+	HAL_PCDEx_PMAConfig(&usb_dc_stm32_state.pcd, ep, PCD_SNG_BUF,
+			    usb_dc_stm32_state.pma_offset);
+	usb_dc_stm32_state.pma_offset += ep_cfg->ep_mps;
+#endif
 	ep_state->ep_mps = ep_cfg->ep_mps;
 
 	switch (ep_cfg->ep_type) {
@@ -409,8 +575,8 @@ int usb_dc_ep_enable(const u8_t ep)
 
 	if (EP_IS_OUT(ep) && ep != EP0_OUT) {
 		return usb_dc_ep_start_read(ep,
-					   usb_dc_stm32_state.ep_buf[EP_IDX(ep)],
-					   USB_OTG_FS_MAX_PACKET_SIZE);
+					  usb_dc_stm32_state.ep_buf[EP_IDX(ep)],
+					  EP_MPS);
 	}
 
 	return 0;
@@ -458,7 +624,7 @@ int usb_dc_ep_write(const u8_t ep, const u8_t *const data,
 	}
 
 	if (!k_is_in_isr()) {
-		irq_disable(STM32F4_IRQ_OTG_FS);
+		irq_disable(CONFIG_USB_IRQ);
 	}
 
 	status = HAL_PCD_EP_Transmit(&usb_dc_stm32_state.pcd, ep,
@@ -478,7 +644,7 @@ int usb_dc_ep_write(const u8_t ep, const u8_t *const data,
 	}
 
 	if (!k_is_in_isr()) {
-		irq_enable(STM32F4_IRQ_OTG_FS);
+		irq_enable(CONFIG_USB_IRQ);
 	}
 
 	if (ret_bytes) {
@@ -516,7 +682,7 @@ int usb_dc_ep_read(const u8_t ep, u8_t *const data, const u32_t max_data_len,
 	 */
 	if (ep != EP0_OUT && !ep_state->read_count) {
 		usb_dc_ep_start_read(ep, usb_dc_stm32_state.ep_buf[EP_IDX(ep)],
-				     USB_OTG_FS_MAX_PACKET_SIZE);
+				     EP_MPS);
 	}
 
 done:
@@ -532,6 +698,10 @@ done:
 void HAL_PCD_ResetCallback(PCD_HandleTypeDef *hpcd)
 {
 	SYS_LOG_DBG("");
+
+	HAL_PCD_EP_Open(&usb_dc_stm32_state.pcd, EP0_IN, EP0_MPS, EP_TYPE_CTRL);
+	HAL_PCD_EP_Open(&usb_dc_stm32_state.pcd, EP0_OUT, EP0_MPS,
+			EP_TYPE_CTRL);
 
 	if (usb_dc_stm32_state.status_cb) {
 		usb_dc_stm32_state.status_cb(USB_DC_RESET, NULL);

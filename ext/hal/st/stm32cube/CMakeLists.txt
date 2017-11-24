@@ -28,6 +28,11 @@ if(CONFIG_SOC_SERIES_STM32F0X)
   zephyr_sources(stm32f0xx/drivers/src/stm32f0xx_hal.c)
   zephyr_sources(stm32f0xx/drivers/src/stm32f0xx_hal_rcc.c)
   zephyr_sources_ifdef(CONFIG_CLOCK_CONTROL_STM32_CUBE stm32f0xx/drivers/src/stm32f0xx_ll_utils.c)
+  zephyr_sources_ifdef(CONFIG_USB_DC_STM32
+    stm32f0xx/drivers/src/stm32f0xx_hal_pcd.c
+    stm32f0xx/drivers/src/stm32f0xx_hal_pcd_ex.c
+    )
+
   zephyr_sources(stm32f0xx/soc/system_stm32f0xx.c)
 endif()
 
@@ -43,6 +48,12 @@ if(CONFIG_SOC_SERIES_STM32F1X)
   zephyr_sources_ifdef(CONFIG_CLOCK_CONTROL_STM32_CUBE stm32f1xx/drivers/src/stm32f1xx_ll_utils.c)
   zephyr_sources_ifdef(CONFIG_PWM stm32f1xx/drivers/src/stm32f1xx_hal_tim.c)
   zephyr_sources_ifdef(CONFIG_I2C stm32f1xx/drivers/src/stm32f1xx_ll_i2c.c)
+  zephyr_sources_ifdef(CONFIG_USB_DC_STM32
+    stm32f1xx/drivers/src/stm32f1xx_ll_usb.c
+    stm32f1xx/drivers/src/stm32f1xx_hal_pcd.c
+    stm32f1xx/drivers/src/stm32f1xx_hal_pcd_ex.c
+    )
+
   zephyr_sources(stm32f1xx/soc/system_stm32f1xx.c)
 endif()
 
@@ -59,6 +70,11 @@ if(CONFIG_SOC_SERIES_STM32F3X)
   zephyr_sources_ifdef(CONFIG_SPI_STM32 stm32f3xx/drivers/src/stm32f3xx_ll_spi.c)
   zephyr_sources_ifdef(CONFIG_I2C stm32f3xx/drivers/src/stm32f3xx_ll_i2c.c)
   zephyr_sources_ifdef(CONFIG_I2C stm32f3xx/drivers/src/stm32f3xx_ll_rcc.c)
+  zephyr_sources_ifdef(CONFIG_USB_DC_STM32
+    stm32f3xx/drivers/src/stm32f3xx_hal_pcd.c
+    stm32f3xx/drivers/src/stm32f3xx_hal_pcd_ex.c
+    )
+
   zephyr_sources(stm32f3xx/soc/system_stm32f3xx.c)
 endif()
 
@@ -111,6 +127,12 @@ if(CONFIG_SOC_SERIES_STM32L4X)
   zephyr_sources_ifdef(CONFIG_PWM stm32l4xx/drivers/src/stm32l4xx_hal_tim.c)
   zephyr_sources_ifdef(CONFIG_I2C stm32l4xx/drivers/src/stm32l4xx_ll_i2c.c)
   zephyr_sources_ifdef(CONFIG_SPI_STM32 stm32l4xx/drivers/src/stm32l4xx_ll_spi.c)
+  zephyr_sources_ifdef(CONFIG_USB_DC_STM32
+    stm32f4xx/drivers/src/stm32f4xx_ll_usb.c
+    stm32f4xx/drivers/src/stm32f4xx_hal_pcd.c
+    stm32f4xx/drivers/src/stm32f4xx_hal_pcd_ex.c
+    )
+
   zephyr_sources(stm32l4xx/soc/system_stm32l4xx.c)
 endif()
 
