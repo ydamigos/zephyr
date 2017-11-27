@@ -552,11 +552,6 @@ int usb_dc_ep_enable(const u8_t ep)
 		return -EIO;
 	}
 
-	ret = usb_dc_ep_clear_stall(ep);
-	if (ret) {
-		return ret;
-	}
-
 	if (EP_IS_OUT(ep) && ep != EP0_OUT) {
 		return usb_dc_ep_start_read(ep,
 					  usb_dc_stm32_state.ep_buf[EP_IDX(ep)],
