@@ -633,8 +633,8 @@ int usb_dc_ep_write(const u8_t ep, const u8_t *const data,
 	return ret;
 }
 
-int usb_dc_ep_read(const u8_t ep, u8_t *const data, const u32_t max_data_len,
-		   u32_t * const read_bytes)
+int usb_dc_ep_read_wait(u8_t ep, u8_t *data, u32_t max_data_len,
+			u32_t *read_bytes)
 {
 	struct usb_dc_stm32_ep_state *ep_state = usb_dc_stm32_get_ep_state(ep);
 	u32_t read_count = ep_state->read_count;
@@ -656,18 +656,39 @@ int usb_dc_ep_read(const u8_t ep, u8_t *const data, const u32_t max_data_len,
 		ep_state->read_offset += read_count;
 	}
 
-	/* If no more data in the buffer, start a new read transaction.
-	 * DataOutStageCallback will called on transaction complete.
-	 */
-	if (ep != EP0_OUT && !ep_state->read_count) {
-		usb_dc_ep_start_read(ep, usb_dc_stm32_state.ep_buf[EP_IDX(ep)],
-				     EP_MPS);
-	}
-
 done:
 	if (read_bytes) {
 		*read_bytes = read_count;
 	}
+
+	return 0;
+}
+
+int usb_dc_ep_read_continue(u8_t ep)
+{
+	struct usb_dc_stm32_ep_state *ep_state = usb_dc_stm32_get_ep_state(ep);
+
+	if ((ep == EP0_OUT) || !EP_IS_OUT(ep)) { /* Check if OUT ep */
+		SYS_LOG_ERR("Not valid endpoint: %02x", ep);
+		return -EINVAL;
+	}
+
+	/* If no more data in the buffer, start a new read transaction.
+	 * DataOutStageCallback will called on transaction complete.
+	 */
+	if (!ep_state->read_count) {
+		usb_dc_ep_start_read(ep, usb_dc_stm32_state.ep_buf[EP_IDX(ep)],
+					EP_MPS);
+	}
+
+	return 0;
+}
+
+int usb_dc_ep_read(const u8_t ep, u8_t *const data, const u32_t max_data_len,
+		   u32_t * const read_bytes)
+{
+	usb_dc_ep_read_wait(ep, data, max_data_len, read_bytes);
+	usb_dc_ep_read_continue(ep);
 
 	return 0;
 }
