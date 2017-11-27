@@ -149,9 +149,9 @@ struct usb_dc_stm32_state {
 	struct usb_dc_stm32_ep_state in_ep_state[NUM_IN_EP];
 	u8_t ep_buf[NUM_BIDIR_EP][EP_MPS];
 
-#ifdef USB
-	u32_t pma_offset;
-#endif /* USB */
+#ifdef CONFIG_USB_DC_STM32_DISCONN_ENABLE
+	struct device *usb_disconnect;
+#endif /* CONFIG_USB_DC_STM32_DISCONN_ENABLE */
 };
 
 static struct usb_dc_stm32_state usb_dc_stm32_state;
@@ -211,6 +211,7 @@ static int usb_dc_stm32_init(void)
 {
 	HAL_StatusTypeDef status;
 	unsigned int i;
+	unsigned int ep, mps, pma_addr;
 
 	usb_dc_stm32_state.pcd.Instance = USB;
 	usb_dc_stm32_state.pcd.Init.speed = PCD_SPEED_FULL;
@@ -219,15 +220,33 @@ static int usb_dc_stm32_init(void)
 	usb_dc_stm32_state.pcd.Init.ep0_mps = PCD_EP0MPS_64;
 	usb_dc_stm32_state.pcd.Init.low_power_enable = 0;
 
-	/* Start PMA configuration for the endpoints after the BTABLE. */
-	usb_dc_stm32_state.pma_offset = USB_BTABLE_SIZE;
-
 	SYS_LOG_DBG("HAL_PCD_Init");
 	status = HAL_PCD_Init(&usb_dc_stm32_state.pcd);
 	if (status != HAL_OK) {
 		SYS_LOG_ERR("PCD_Init failed, %d", (int)status);
 		return -EIO;
 	}
+
+	/* each endpoint is associated with two packet buffers. Buffers can
+	 * be placed anywhere inside the packet memory because their location
+	 * and size is specfied in a buffer descriptor table, which is also
+	 * located in the packet memory. so we need reserve space for restore
+	 * buffer descriptor table */
+	pma_addr = USB_BTABLE_SIZE;
+
+	for (i = 0; i < NUM_BIDIR_EP * 2; i++) { /* all endpoint is bi-dir */
+		ep = (i >> 1) | ((i & 0x1) << 7);
+		mps = (i < 2) ? EP0_MPS: EP_MPS;
+
+		HAL_PCDEx_PMAConfig(&usb_dc_stm32_state.pcd, ep,
+				PCD_SNG_BUF, pma_addr);
+		SYS_LOG_DBG("PMA: EP%02X in %03X", ep, pma_addr);
+		pma_addr += mps;
+
+		if (pma_addr + mps > CONFIG_USB_RAM_SIZE)
+			break; /* no enough memory for next endpoint */
+	}
+
 
 	SYS_LOG_DBG("HAL_PCD_Start");
 	status = HAL_PCD_Start(&usb_dc_stm32_state.pcd);
@@ -310,6 +329,16 @@ int usb_dc_attach(void)
 	int ret;
 
 	SYS_LOG_DBG("");
+
+#ifdef CONFIG_USB_DC_STM32_DISCONN_ENABLE
+	usb_dc_stm32_state.usb_disconnect =
+		device_get_binding(CONFIG_USB_DC_STM32_DISCONN_GPIO_PORT_NAME);
+	gpio_pin_configure(usb_dc_stm32_state.usb_disconnect,
+			   CONFIG_USB_DC_STM32_DISCONN_PIN, GPIO_DIR_OUT);
+	gpio_pin_write(usb_dc_stm32_state.usb_disconnect,
+		       CONFIG_USB_DC_STM32_DISCONN_PIN,
+		       CONFIG_USB_DC_STM32_DISCONN_PIN_LEVEL);
+#endif /* CONFIG_USB_DC_STM32_DISCONN_ENABLE */
 
 	ret = usb_dc_stm32_clock_enable();
 	if (ret) {
@@ -416,15 +445,6 @@ int usb_dc_ep_configure(const struct usb_dc_ep_cfg_data * const ep_cfg)
 		return -EINVAL;
 	}
 
-#ifdef USB
-	if (CONFIG_USB_RAM_SIZE <=
-	    (usb_dc_stm32_state.pma_offset + ep_cfg->ep_mps)) {
-		return -EINVAL;
-	}
-	HAL_PCDEx_PMAConfig(&usb_dc_stm32_state.pcd, ep, PCD_SNG_BUF,
-			    usb_dc_stm32_state.pma_offset);
-	usb_dc_stm32_state.pma_offset += ep_cfg->ep_mps;
-#endif
 	ep_state->ep_mps = ep_cfg->ep_mps;
 
 	switch (ep_cfg->ep_type) {
@@ -532,11 +552,6 @@ int usb_dc_ep_enable(const u8_t ep)
 		return -EIO;
 	}
 
-	ret = usb_dc_ep_clear_stall(ep);
-	if (ret) {
-		return ret;
-	}
-
 	if (EP_IS_OUT(ep) && ep != EP0_OUT) {
 		return usb_dc_ep_start_read(ep,
 					  usb_dc_stm32_state.ep_buf[EP_IDX(ep)],
@@ -618,8 +633,8 @@ int usb_dc_ep_write(const u8_t ep, const u8_t *const data,
 	return ret;
 }
 
-int usb_dc_ep_read(const u8_t ep, u8_t *const data, const u32_t max_data_len,
-		   u32_t * const read_bytes)
+int usb_dc_ep_read_wait(u8_t ep, u8_t *data, u32_t max_data_len,
+			u32_t *read_bytes)
 {
 	struct usb_dc_stm32_ep_state *ep_state = usb_dc_stm32_get_ep_state(ep);
 	u32_t read_count = ep_state->read_count;
@@ -641,18 +656,39 @@ int usb_dc_ep_read(const u8_t ep, u8_t *const data, const u32_t max_data_len,
 		ep_state->read_offset += read_count;
 	}
 
-	/* If no more data in the buffer, start a new read transaction.
-	 * DataOutStageCallback will called on transaction complete.
-	 */
-	if (ep != EP0_OUT && !ep_state->read_count) {
-		usb_dc_ep_start_read(ep, usb_dc_stm32_state.ep_buf[EP_IDX(ep)],
-				     EP_MPS);
-	}
-
 done:
 	if (read_bytes) {
 		*read_bytes = read_count;
 	}
+
+	return 0;
+}
+
+int usb_dc_ep_read_continue(u8_t ep)
+{
+	struct usb_dc_stm32_ep_state *ep_state = usb_dc_stm32_get_ep_state(ep);
+
+	if ((ep == EP0_OUT) || !EP_IS_OUT(ep)) { /* Check if OUT ep */
+		SYS_LOG_ERR("Not valid endpoint: %02x", ep);
+		return -EINVAL;
+	}
+
+	/* If no more data in the buffer, start a new read transaction.
+	 * DataOutStageCallback will called on transaction complete.
+	 */
+	if (!ep_state->read_count) {
+		usb_dc_ep_start_read(ep, usb_dc_stm32_state.ep_buf[EP_IDX(ep)],
+					EP_MPS);
+	}
+
+	return 0;
+}
+
+int usb_dc_ep_read(const u8_t ep, u8_t *const data, const u32_t max_data_len,
+		   u32_t * const read_bytes)
+{
+	usb_dc_ep_read_wait(ep, data, max_data_len, read_bytes);
+	usb_dc_ep_read_continue(ep);
 
 	return 0;
 }
